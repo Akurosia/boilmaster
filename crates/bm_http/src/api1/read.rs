@@ -271,7 +271,7 @@ impl RowReader {
 	pub fn track_rows_read_and_maybe_explode(&mut self, extra: u32) -> Result<()> {
 		// This is a horrific hardcoded hack.
 		self.rows_read += extra;
-		match self.rows_read > 20_000 {
+		match self.rows_read > 200_000 {
 			true => Err(Error::Invalid("Fulfilling this request would require processing over 20,000 rows of data. Please limit the scope of the fields you are reading. If you're hitting this, consider joining the XIVAPI discord @ discord.gg/MFFVHWC - we may be able to help improve your query.".into())),
 			false => Ok(()),
 		}
