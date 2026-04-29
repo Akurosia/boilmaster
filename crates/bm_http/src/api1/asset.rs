@@ -598,6 +598,10 @@ async fn uld_export(
 
 	let mut found = 1usize;
 	for texture_path in parsed.texture_paths {
+		if !is_texture_path(&texture_path) {
+			continue;
+		}
+
 		let bytes = match asset.convert(version_key, &texture_path, format.0) {
 			Ok(bytes) => bytes,
 			Err(bm_asset::Error::NotFound(..)) => continue,
@@ -640,7 +644,7 @@ async fn uld_archive(
 	let mut found = 0usize;
 
 	for path in paths {
-		if path.ends_with(".uld") {
+		if path.to_ascii_lowercase().ends_with(".uld") {
 			let bytes = match asset.raw(version_key, &path) {
 				Ok(bytes) => bytes,
 				Err(bm_asset::Error::NotFound(..)) => continue,
@@ -652,7 +656,7 @@ async fn uld_archive(
 			continue;
 		}
 
-		if path.ends_with(".tex") {
+		if is_texture_path(&path) {
 			let bytes = match asset.convert(version_key, &path, format.0) {
 				Ok(bytes) => bytes,
 				Err(bm_asset::Error::NotFound(..)) => continue,
@@ -822,8 +826,23 @@ async fn fetch_perchbird_paths(prefix: &str) -> Result<Vec<String>> {
 }
 
 fn replace_extension(path: &str, extension: &str) -> String {
-	let stem = path.strip_suffix(".tex").unwrap_or(path);
+	let stem = strip_texture_extension(path).unwrap_or(path);
 	format!("{stem}.{extension}")
+}
+
+fn strip_texture_extension(path: &str) -> Option<&str> {
+	for suffix in [".tex", ".atex"] {
+		if let Some(stem) = path.strip_suffix(suffix) {
+			return Some(stem);
+		}
+	}
+
+	None
+}
+
+fn is_texture_path(path: &str) -> bool {
+	let lower = path.to_ascii_lowercase();
+	lower.ends_with(".tex") || lower.ends_with(".atex")
 }
 
 async fn cache_layer(
