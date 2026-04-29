@@ -295,12 +295,14 @@ name = "bm_asset"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "binrw",
  "bm_data",
  "bm_version",
  "image",
  "image_dds",
  "ironworks",
  "itertools",
+ "schemars",
  "serde",
  "strum",
  "thiserror 2.0.11",

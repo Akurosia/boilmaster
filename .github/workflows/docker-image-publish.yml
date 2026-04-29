@@ -24,15 +24,15 @@ jobs:
             arch: x86_64-unknown-linux-gnu
             target: linux/amd64
             zlib: x86_64-linux-gnu
-            pkg-config-path: /usr/lib/pkgconfig/
-            pkg-config-sysroot-dir: /usr/lib/aarch64-linux-gnu/
+            pkg_config_path: /usr/lib/pkgconfig/
+            pkg_config_sysroot_dir: /usr/lib/aarch64-linux-gnu/
           - os_name: arm64
             os: ubuntu-latest
             arch: aarch64-unknown-linux-gnu
             target: linux/arm64
             zlib: aarch64-linux-gnu
-            pkg-config-path: /usr/lib/aarch64-linux-gnu/pkgconfig/
-            pkg-config-sysroot-dir: /usr/lib/aarch64-linux-gnu/
+            pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig/
+            pkg_config_sysroot_dir: /usr/lib/aarch64-linux-gnu/
 
     runs-on: ${{ matrix.platform.os }}
 
@@ -82,8 +82,8 @@ jobs:
           build-args: |
             arch=${{ matrix.platform.arch }}
             zlib=${{ matrix.platform.zlib }}
-            pkg-config-path=${{ matrix.platform.pkg-config-path}}
-            pkg-config-sysroot-dir=${{ matrix.platform.pkg-config-sysroot-dir }}
+            pkg_config_path=${{ matrix.platform.pkg_config_path}}
+            pkg_config_sysroot_dir=${{ matrix.platform.pkg_config_sysroot_dir }}
             target=${{ matrix.platform.target }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}

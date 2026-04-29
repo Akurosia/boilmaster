@@ -13,7 +13,8 @@ RUN if [ "${arch}" = "aarch64-unknown-linux-gnu" ]; then \
     rustup target add ${arch}; \
     fi
 
-RUN cargo install cargo-chef --locked
+# Keep cargo-chef pinned while the project toolchain stays on Rust 1.85.
+RUN cargo install cargo-chef --version 0.1.75 --locked
 
 # Setup recipe
 FROM base AS planner
@@ -37,10 +38,10 @@ COPY . .
 
 ARG arch
 
-ARG pkg-config-path
-ARG pkg-config-sysroot-dir
-ENV PKG_CONFIG_PATH=${pkg-config-path}
-ENV PKG_CONFIG_SYSROOT_DIR=${pkg-config-sysroot-dir}
+ARG pkg_config_path
+ARG pkg_config_sysroot_dir
+ENV PKG_CONFIG_PATH=${pkg_config_path}
+ENV PKG_CONFIG_SYSROOT_DIR=${pkg_config_sysroot_dir}
 
 RUN cargo build --release --target ${arch} --bin boilmaster
 

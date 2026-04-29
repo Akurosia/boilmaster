@@ -9,6 +9,7 @@ use super::{
 	error::{Error, Result},
 	format::Format,
 	texture,
+	uld::ParsedUld,
 };
 
 pub struct Service {
@@ -52,6 +53,11 @@ impl Service {
 				}
 				other => Error::Failure(other.into()),
 			})
+	}
+
+	pub fn uld(&self, version: VersionKey, path: &str) -> Result<ParsedUld> {
+		let bytes = self.raw(version, path)?;
+		ParsedUld::parse(&bytes).map_err(Error::from)
 	}
 
 	pub fn map(

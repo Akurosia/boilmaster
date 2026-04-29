@@ -72,6 +72,8 @@ pub fn router(config: Config, state: ApiState) -> ApiRouter {
 		.api_route("/maps", get_with(maps_archive, maps_archive_docs))
 		.api_route("/map/{territory}/{index}", get_with(map, map_docs))
 		.api_route("/uld/archive", get_with(uld_archive, uld_archive_docs))
+		.api_route("/uld/export", get_with(uld_export, uld_export_docs))
+		.api_route("/uld/references", get_with(uld_references, uld_references_docs))
 		.api_route("/uld", get_with(uld, uld_docs))
 		// Fall back to the old asset endpoint for compatibility.
 		.route("/{*path}", axum::routing::get(asset1))
@@ -115,6 +117,17 @@ struct UldQuery {
 #[derive(Deserialize, JsonSchema)]
 struct UldArchiveQuery {
 	/// Format that `.tex` files should be converted into inside the archive.
+	#[schemars(example = "example_format")]
+	format: SchemaFormat,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UldExportQuery {
+	/// Full ULD path to parse and export.
+	#[schemars(example = "example_uld_path")]
+	path: String,
+
+	/// Format that referenced `.tex` files should be converted into.
 	#[schemars(example = "example_format")]
 	format: SchemaFormat,
 }
@@ -370,6 +383,36 @@ fn uld_archive_docs(operation: TransformOperation) -> TransformOperation {
 		.response_with::<304, (), _>(|res| res.description("not modified"))
 }
 
+#[derive(Serialize, JsonSchema)]
+struct UldReferencesResponse {
+	path: String,
+	image_nodes: Vec<bm_asset::ImageNodeReference>,
+	texture_paths: Vec<String>,
+}
+
+fn uld_references_docs(operation: TransformOperation) -> TransformOperation {
+	operation
+		.summary("read parsed uld references")
+		.description(
+			"Parse a `.uld` file and return the discovered image nodes plus embedded texture paths referenced by the layout.",
+		)
+		.response_with::<200, axum::Json<UldReferencesResponse>, _>(|response| response)
+}
+
+fn uld_export_docs(operation: TransformOperation) -> TransformOperation {
+	operation
+		.summary("export a parsed uld layout")
+		.description(
+			"Parse a single `.uld` file and return a zip containing the raw layout plus only the referenced textures discovered inside it.",
+		)
+		.response_with::<200, Vec<u8>, _>(|mut response| {
+			let content = &mut response.inner().content;
+			content.clear();
+			content.insert("application/zip".into(), openapi::MediaType::default());
+			response
+		})
+}
+
 #[debug_handler(state = AssetState)]
 async fn icons_archive(
 	VersionQuery(version_key): VersionQuery,
@@ -522,6 +565,68 @@ async fn uld(
 		bytes,
 	)
 		.into_response())
+}
+
+#[debug_handler(state = AssetState)]
+async fn uld_references(
+	VersionQuery(version_key): VersionQuery,
+	Query(UldQuery { path }): Query<UldQuery>,
+	State(Service { asset, .. }): State<Service>,
+) -> Result<impl IntoApiResponse> {
+	let path = validate_uld_path(&path)?;
+	let parsed = asset.uld(version_key, &path)?;
+
+	Ok(axum::Json(UldReferencesResponse {
+		path,
+		image_nodes: parsed.image_nodes,
+		texture_paths: parsed.texture_paths,
+	}))
+}
+
+#[debug_handler(state = AssetState)]
+async fn uld_export(
+	VersionQuery(version_key): VersionQuery,
+	Query(UldExportQuery { path, format }): Query<UldExportQuery>,
+	State(Service { asset, .. }): State<Service>,
+) -> Result<impl IntoApiResponse> {
+	let path = validate_uld_path(&path)?;
+	let parsed = asset.uld(version_key, &path)?;
+	let raw = asset.raw(version_key, &path)?;
+
+	let mut writer = zip_writer();
+	write_zip_file(&mut writer, &path, &raw)?;
+
+	let mut found = 1usize;
+	for texture_path in parsed.texture_paths {
+		let bytes = match asset.convert(version_key, &texture_path, format.0) {
+			Ok(bytes) => bytes,
+			Err(bm_asset::Error::NotFound(..)) => continue,
+			Err(error) => return Err(error.into()),
+		};
+
+		write_zip_file(
+			&mut writer,
+			&replace_extension(&texture_path, format.0.extension()),
+			&bytes,
+		)?;
+		found += 1;
+	}
+
+	if found == 1 {
+		return Err(super::error::Error::NotFound(format!(
+			"no referenced textures found for {}",
+			path
+		)));
+	}
+
+	let stem = std::path::Path::new(&path)
+		.file_stem()
+		.and_then(OsStr::to_str)
+		.unwrap_or("layout");
+	zip_response(
+		writer,
+		format!("{}_uld_export_{}.zip", stem, format.0.extension()),
+	)
 }
 
 #[debug_handler(state = AssetState)]
