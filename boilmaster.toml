@@ -17,6 +17,7 @@ password = "password"
 
 [http.api1.asset]
 maxage = 604800 # 1 week
+directory = "asset"
 
 [http.api1.search]
 limit.default = 100

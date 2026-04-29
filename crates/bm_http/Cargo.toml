@@ -28,7 +28,9 @@ aide = { workspace = true, features = [
 axum = { workspace = true, features = ["macros"] }
 axum-extra = { workspace = true, features = ["typed-header"] }
 either.workspace = true
+figment.workspace = true
 flate2.workspace = true
+fs4.workspace = true
 git-version.workspace = true
 ironworks = { workspace = true }
 ironworks_schema.workspace = true

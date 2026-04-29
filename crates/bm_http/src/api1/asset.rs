@@ -2,7 +2,9 @@ use std::{
 	collections::BTreeSet,
 	ffi::OsStr,
 	hash::{Hash, Hasher},
-	io::{Cursor, Write},
+	io::{Cursor, Read, Write},
+	fs,
+	path::{Path as StdPath, PathBuf},
 	time::Duration,
 };
 
@@ -23,6 +25,8 @@ use axum_extra::{
 	headers::{CacheControl, ContentType, ETag, HeaderMapExt, IfNoneMatch},
 };
 use bm_asset::Format;
+use fs4::fs_std::FileExt;
+use figment::value::magic::RelativePathBuf;
 use schemars::{
 	JsonSchema,
 	r#gen::SchemaGenerator,
@@ -51,18 +55,22 @@ const PERCHBIRD_PATHLIST_URL: &str = "https://rl2.perchbird.dev/download/PathLis
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
 	maxage: u64,
+	#[serde(default = "default_cache_directory")]
+	directory: RelativePathBuf,
 }
 
 #[derive(Clone, FromRef)]
 struct AssetState {
 	services: Service,
-	config: Config,
+	maxage: u64,
+	cache_directory: PathBuf,
 }
 
 pub fn router(config: Config, state: ApiState) -> ApiRouter {
 	let state = AssetState {
 		services: state.services,
-		config,
+		maxage: config.maxage,
+		cache_directory: config.directory.relative(),
 	};
 
 	ApiRouter::new()
@@ -417,27 +425,39 @@ fn uld_export_docs(operation: TransformOperation) -> TransformOperation {
 async fn icons_archive(
 	VersionQuery(version_key): VersionQuery,
 	Query(IconArchiveQuery { format }): Query<IconArchiveQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(AssetState {
+		services: Service { asset, .. },
+		cache_directory,
+		..
+	}): State<AssetState>,
 ) -> Result<impl IntoApiResponse> {
-	let mut writer = zip_writer();
 	let extension = format.0.extension();
-	let mut found = 0usize;
+	let filename = format!("ui_icons_all_{extension}.zip");
+	let cache_key = format!("icons/all-{extension}.zip");
+	let bytes = cached_archive(
+		&cache_directory,
+		version_key,
+		&cache_key,
+		|| {
+			let mut writer = zip_writer();
+			let mut found = 0usize;
 
-	for group_index in 0..ICON_GROUP_COUNT {
-		let group = group_index * ICONS_PER_GROUP;
-		found += write_icon_group(&mut writer, &asset, version_key, group, format.0)?;
-	}
+			for group_index in 0..ICON_GROUP_COUNT {
+				let group = group_index * ICONS_PER_GROUP;
+				found += write_icon_group(&mut writer, &asset, version_key, group, format.0)?;
+			}
 
-	if found == 0 {
-		return Err(super::error::Error::NotFound(
-			"no icons found in standard icon groups".into(),
-		));
-	}
+			if found == 0 {
+				return Err(super::error::Error::NotFound(
+					"no icons found in standard icon groups".into(),
+				));
+			}
 
-	zip_response(
-		writer,
-		format!("ui_icons_all_{extension}.zip"),
-	)
+			finish_zip(writer)
+		},
+	)?;
+
+	zip_bytes_response(bytes, filename)
 }
 
 #[debug_handler(state = AssetState)]
@@ -445,22 +465,35 @@ async fn icon_archive(
 	Path(IconArchivePath { group }): Path<IconArchivePath>,
 	VersionQuery(version_key): VersionQuery,
 	Query(IconArchiveQuery { format }): Query<IconArchiveQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(AssetState {
+		services: Service { asset, .. },
+		cache_directory,
+		..
+	}): State<AssetState>,
 ) -> Result<impl IntoApiResponse> {
 	let group = parse_icon_group(&group)?;
-	let mut writer = zip_writer();
-	let found = write_icon_group(&mut writer, &asset, version_key, group, format.0)?;
+	let extension = format.0.extension();
+	let filename = format!("ui_icon_{group:06}_{extension}.zip");
+	let cache_key = format!("icons/group-{group:06}-{extension}.zip");
+	let bytes = cached_archive(
+		&cache_directory,
+		version_key,
+		&cache_key,
+		|| {
+			let mut writer = zip_writer();
+			let found = write_icon_group(&mut writer, &asset, version_key, group, format.0)?;
 
-	if found == 0 {
-		return Err(super::error::Error::NotFound(format!(
-			"no icons found for group {group:06}"
-		)));
-	}
+			if found == 0 {
+				return Err(super::error::Error::NotFound(format!(
+					"no icons found for group {group:06}"
+				)));
+			}
 
-	zip_response(
-		writer,
-		format!("ui_icon_{group:06}_{}.zip", format.0.extension()),
-	)
+			finish_zip(writer)
+		},
+	)?;
+
+	zip_bytes_response(bytes, filename)
 }
 
 fn parse_icon_group(value: &str) -> Result<u32> {
@@ -487,54 +520,67 @@ fn parse_icon_group(value: &str) -> Result<u32> {
 async fn maps_archive(
 	VersionQuery(version_key): VersionQuery,
 	Query(MapQuery { format }): Query<MapQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(AssetState {
+		services: Service { asset, .. },
+		cache_directory,
+		..
+	}): State<AssetState>,
 ) -> Result<impl IntoApiResponse> {
-	let mut writer = zip_writer();
 	let format = format.unwrap_or_else(default_map_format).0;
-	let mut found = 0usize;
+	let extension = format.extension();
+	let filename = format!("ui_maps_all_{extension}.zip");
+	let cache_key = format!("maps/all-{extension}.zip");
+	let bytes = cached_archive(
+		&cache_directory,
+		version_key,
+		&cache_key,
+		|| {
+			let mut writer = zip_writer();
+			let mut found = 0usize;
 
-	for &a in MAP_LETTERS {
-		for b in b'0'..=b'9' {
-			for &c in MAP_LETTERS {
-				for d in b'0'..=b'9' {
-					let territory = format!(
-						"{}{}{}{}",
-						a as char, b as char, c as char, d as char
-					);
+			for &a in MAP_LETTERS {
+				for b in b'0'..=b'9' {
+					for &c in MAP_LETTERS {
+						for d in b'0'..=b'9' {
+							let territory = format!(
+								"{}{}{}{}",
+								a as char, b as char, c as char, d as char
+							);
 
-					for index in 0..MAP_INDEX_COUNT {
-						let index = format!("{index:02}");
-						let bytes = match asset.map(version_key, &territory, &index, format) {
-							Ok(bytes) => bytes,
-							Err(bm_asset::Error::NotFound(..)) => continue,
-							Err(error) => return Err(error.into()),
-						};
+							for index in 0..MAP_INDEX_COUNT {
+								let index = format!("{index:02}");
+								let bytes = match asset.map(version_key, &territory, &index, format) {
+									Ok(bytes) => bytes,
+									Err(bm_asset::Error::NotFound(..)) => continue,
+									Err(error) => return Err(error.into()),
+								};
 
-						write_zip_file(
-							&mut writer,
-							&format!(
-								"ui/map/{territory}/{index}/{territory}_{index}.{}",
-								format.extension()
-							),
-							&bytes,
-						)?;
-						found += 1;
+								write_zip_file(
+									&mut writer,
+									&format!(
+										"ui/map/{territory}/{index}/{territory}_{index}.{}",
+										format.extension()
+									),
+									&bytes,
+								)?;
+								found += 1;
+							}
+						}
 					}
 				}
 			}
-		}
-	}
 
-	if found == 0 {
-		return Err(super::error::Error::NotFound(
-			"no maps found in standard territory/index combinations".into(),
-		));
-	}
+			if found == 0 {
+				return Err(super::error::Error::NotFound(
+					"no maps found in standard territory/index combinations".into(),
+				));
+			}
 
-	zip_response(
-		writer,
-		format!("ui_maps_all_{}.zip", format.extension()),
-	)
+			finish_zip(writer)
+		},
+	)?;
+
+	zip_bytes_response(bytes, filename)
 }
 
 #[debug_handler(state = AssetState)]
@@ -587,101 +633,130 @@ async fn uld_references(
 async fn uld_export(
 	VersionQuery(version_key): VersionQuery,
 	Query(UldExportQuery { path, format }): Query<UldExportQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(AssetState {
+		services: Service { asset, .. },
+		cache_directory,
+		..
+	}): State<AssetState>,
 ) -> Result<impl IntoApiResponse> {
 	let path = validate_uld_path(&path)?;
-	let parsed = asset.uld(version_key, &path)?;
-	let raw = asset.raw(version_key, &path)?;
-
-	let mut writer = zip_writer();
-	write_zip_file(&mut writer, &path, &raw)?;
-
-	let mut found = 1usize;
-	for texture_path in parsed.texture_paths {
-		if !is_texture_path(&texture_path) {
-			continue;
-		}
-
-		let bytes = match asset.convert(version_key, &texture_path, format.0) {
-			Ok(bytes) => bytes,
-			Err(bm_asset::Error::NotFound(..)) => continue,
-			Err(error) => return Err(error.into()),
-		};
-
-		write_zip_file(
-			&mut writer,
-			&replace_extension(&texture_path, format.0.extension()),
-			&bytes,
-		)?;
-		found += 1;
-	}
-
-	if found == 1 {
-		return Err(super::error::Error::NotFound(format!(
-			"no referenced textures found for {}",
-			path
-		)));
-	}
-
+	let extension = format.0.extension();
 	let stem = std::path::Path::new(&path)
 		.file_stem()
 		.and_then(OsStr::to_str)
 		.unwrap_or("layout");
-	zip_response(
-		writer,
-		format!("{}_uld_export_{}.zip", stem, format.0.extension()),
-	)
+	let filename = format!("{}_uld_export_{extension}.zip", stem);
+	let cache_key = format!(
+		"uld/export-{:016x}-{extension}.zip",
+		hash_string(&path)
+	);
+	let bytes = cached_archive(
+		&cache_directory,
+		version_key,
+		&cache_key,
+		|| {
+			let parsed = asset.uld(version_key, &path)?;
+			let raw = asset.raw(version_key, &path)?;
+
+			let mut writer = zip_writer();
+			write_zip_file(&mut writer, &path, &raw)?;
+
+			let mut found = 1usize;
+			for texture_path in parsed.texture_paths {
+				if !is_texture_path(&texture_path) {
+					continue;
+				}
+
+				let bytes = match asset.convert(version_key, &texture_path, format.0) {
+					Ok(bytes) => bytes,
+					Err(bm_asset::Error::NotFound(..)) => continue,
+					Err(error) => return Err(error.into()),
+				};
+
+				write_zip_file(
+					&mut writer,
+					&replace_extension(&texture_path, extension),
+					&bytes,
+				)?;
+				found += 1;
+			}
+
+			if found == 1 {
+				return Err(super::error::Error::NotFound(format!(
+					"no referenced textures found for {}",
+					path
+				)));
+			}
+
+			finish_zip(writer)
+		},
+	)?;
+
+	zip_bytes_response(bytes, filename)
 }
 
 #[debug_handler(state = AssetState)]
 async fn uld_archive(
 	VersionQuery(version_key): VersionQuery,
 	Query(UldArchiveQuery { format }): Query<UldArchiveQuery>,
-	State(Service { asset, .. }): State<Service>,
+	State(AssetState {
+		services: Service { asset, .. },
+		cache_directory,
+		..
+	}): State<AssetState>,
 ) -> Result<impl IntoApiResponse> {
-	let paths = fetch_perchbird_paths("ui/uld/").await?;
-	let mut writer = zip_writer();
-	let mut found = 0usize;
+	let extension = format.0.extension();
+	let filename = format!("ui_uld_archive_{extension}.zip");
+	let cache_key = format!("uld/archive-{extension}.zip");
+	let cache_path = archive_cache_path(&cache_directory, version_key, &cache_key);
+	let bytes = if let Some(bytes) = read_cached_archive(&cache_path)? {
+		bytes
+	} else {
+		let paths = fetch_perchbird_paths("ui/uld/").await?;
+		let mut writer = zip_writer();
+		let mut found = 0usize;
 
-	for path in paths {
-		if path.to_ascii_lowercase().ends_with(".uld") {
-			let bytes = match asset.raw(version_key, &path) {
-				Ok(bytes) => bytes,
-				Err(bm_asset::Error::NotFound(..)) => continue,
-				Err(error) => return Err(error.into()),
-			};
+		for path in paths {
+			if path.to_ascii_lowercase().ends_with(".uld") {
+				let bytes = match asset.raw(version_key, &path) {
+					Ok(bytes) => bytes,
+					Err(bm_asset::Error::NotFound(..)) => continue,
+					Err(error) => return Err(error.into()),
+				};
 
-			write_zip_file(&mut writer, &path, &bytes)?;
-			found += 1;
-			continue;
+				write_zip_file(&mut writer, &path, &bytes)?;
+				found += 1;
+				continue;
+			}
+
+			if is_texture_path(&path) {
+				let bytes = match asset.convert(version_key, &path, format.0) {
+					Ok(bytes) => bytes,
+					Err(bm_asset::Error::NotFound(..)) => continue,
+					Err(error) => return Err(error.into()),
+				};
+
+				write_zip_file(
+					&mut writer,
+					&replace_extension(&path, extension),
+					&bytes,
+				)?;
+				found += 1;
+			}
 		}
 
-		if is_texture_path(&path) {
-			let bytes = match asset.convert(version_key, &path, format.0) {
-				Ok(bytes) => bytes,
-				Err(bm_asset::Error::NotFound(..)) => continue,
-				Err(error) => return Err(error.into()),
-			};
-
-			write_zip_file(
-				&mut writer,
-				&replace_extension(&path, format.0.extension()),
-				&bytes,
-			)?;
-			found += 1;
+		if found == 0 {
+			return Err(super::error::Error::NotFound(
+				"no uld files or textures found from path list".into(),
+			));
 		}
-	}
 
-	if found == 0 {
-		return Err(super::error::Error::NotFound(
-			"no uld files or textures found from path list".into(),
-		));
-	}
+		let bytes = finish_zip(writer)?;
+		write_cached_archive(&cache_path, &bytes)?;
+		bytes
+	};
 
-	zip_response(
-		writer,
-		format!("ui_uld_archive_{}.zip", format.0.extension()),
-	)
+	zip_bytes_response(bytes, filename)
 }
 
 #[debug_handler]
@@ -759,12 +834,14 @@ fn write_zip_file(
 	Ok(())
 }
 
-fn zip_response(
-	writer: zip::ZipWriter<Cursor<Vec<u8>>>,
-	filename: String,
-) -> Result<Response> {
-	let bytes = writer.finish().map_err(anyhow::Error::from)?.into_inner();
+fn finish_zip(writer: zip::ZipWriter<Cursor<Vec<u8>>>) -> Result<Vec<u8>> {
+	Ok(writer
+		.finish()
+		.map_err(anyhow::Error::from)
+		.map(|cursor| cursor.into_inner())?)
+}
 
+fn zip_bytes_response(bytes: Vec<u8>, filename: String) -> Result<Response> {
 	Ok((
 		TypedHeader(
 			ContentType::from(
@@ -780,6 +857,74 @@ fn zip_response(
 		bytes,
 	)
 		.into_response())
+}
+
+fn cached_archive(
+	cache_root: &StdPath,
+	version_key: bm_version::VersionKey,
+	cache_key: &str,
+	build: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+	let path = archive_cache_path(cache_root, version_key, cache_key);
+
+	if let Some(bytes) = read_cached_archive(&path)? {
+		return Ok(bytes);
+	}
+
+	let bytes = build()?;
+	write_cached_archive(&path, &bytes)?;
+	Ok(bytes)
+}
+
+fn archive_cache_path(
+	cache_root: &StdPath,
+	version_key: bm_version::VersionKey,
+	cache_key: &str,
+) -> PathBuf {
+	cache_root
+		.join(version_key.to_string())
+		.join(cache_key.replace('\\', "/"))
+}
+
+fn read_cached_archive(path: &StdPath) -> Result<Option<Vec<u8>>> {
+	let mut file = match fs::File::open(path) {
+		Ok(file) => file,
+		Err(error) => {
+			return match error.kind() {
+				std::io::ErrorKind::NotFound => Ok(None),
+				_ => Err(anyhow::Error::from(error).into()),
+			};
+		}
+	};
+
+	FileExt::lock_shared(&file).map_err(anyhow::Error::from)?;
+
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes).map_err(anyhow::Error::from)?;
+	Ok(Some(bytes))
+}
+
+fn write_cached_archive(path: &StdPath, bytes: &[u8]) -> Result<()> {
+	if let Some(parent) = path.parent() {
+		fs::create_dir_all(parent).map_err(anyhow::Error::from)?;
+	}
+
+	let mut file = fs::File::options()
+		.create(true)
+		.write(true)
+		.truncate(true)
+		.open(path)
+		.map_err(anyhow::Error::from)?;
+
+	FileExt::lock_exclusive(&file).map_err(anyhow::Error::from)?;
+
+	file.write_all(bytes).map_err(anyhow::Error::from)?;
+	file.sync_all().map_err(anyhow::Error::from)?;
+	Ok(())
+}
+
+fn default_cache_directory() -> RelativePathBuf {
+	"asset".into()
 }
 
 fn default_map_format() -> SchemaFormat {
@@ -845,11 +990,17 @@ fn is_texture_path(path: &str) -> bool {
 	lower.ends_with(".tex") || lower.ends_with(".atex")
 }
 
+fn hash_string(value: &str) -> u64 {
+	let mut hasher = SeaHasher::new();
+	value.hash(&mut hasher);
+	hasher.finish()
+}
+
 async fn cache_layer(
 	uri: OriginalUri,
 	VersionQuery(version): VersionQuery,
 	header_if_none_match: Option<TypedHeader<IfNoneMatch>>,
-	State(config): State<Config>,
+	State(AssetState { maxage, .. }): State<AssetState>,
 	request: Request,
 	next: middleware::Next,
 ) -> Response {
@@ -876,7 +1027,7 @@ async fn cache_layer(
 	let cache_control = CacheControl::new()
 		.with_public()
 		.with_immutable()
-		.with_max_age(Duration::from_secs(config.maxage));
+		.with_max_age(Duration::from_secs(maxage));
 
 	let headers = response.headers_mut();
 	headers.typed_insert(etag);
