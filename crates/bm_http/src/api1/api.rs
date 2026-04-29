@@ -20,7 +20,7 @@ use super::{asset, read::RowReaderState, search, sheet, version};
 
 const OPENAPI_JSON_ROUTE: &str = "/openapi.json";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
 	asset: asset::Config,
 	search: search::Config,
@@ -67,6 +67,14 @@ pub fn router(config: Config, state: HttpState) -> Router {
 		)
 		.layer(CorsLayer::permissive())
 		.route("/docs", get(scalar))
+}
+
+pub async fn start(
+	cancel: tokio_util::sync::CancellationToken,
+	config: Config,
+	state: HttpState,
+) -> anyhow::Result<()> {
+	asset::start(cancel, config.asset, state.services).await
 }
 
 fn api_docs(api: TransformOpenApi) -> TransformOpenApi {

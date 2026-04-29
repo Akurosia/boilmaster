@@ -27,6 +27,8 @@ use axum_extra::{
 use bm_asset::Format;
 use fs4::fs_std::FileExt;
 use figment::value::magic::RelativePathBuf;
+use tokio::{select, time};
+use tokio_util::sync::CancellationToken;
 use schemars::{
 	JsonSchema,
 	r#gen::SchemaGenerator,
@@ -57,6 +59,21 @@ pub struct Config {
 	maxage: u64,
 	#[serde(default = "default_cache_directory")]
 	directory: RelativePathBuf,
+	#[serde(default)]
+	prewarm: PrewarmConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PrewarmConfig {
+	enabled: bool,
+	#[serde(default = "default_prewarm_formats")]
+	formats: Vec<Format>,
+	#[serde(default = "default_true")]
+	icons: bool,
+	#[serde(default = "default_true")]
+	maps: bool,
+	#[serde(default = "default_true")]
+	uld_archive: bool,
 }
 
 #[derive(Clone, FromRef)]
@@ -87,6 +104,50 @@ pub fn router(config: Config, state: ApiState) -> ApiRouter {
 		.route("/{*path}", axum::routing::get(asset1))
 		.layer(middleware::from_fn_with_state(state.clone(), cache_layer))
 		.with_state(state)
+}
+
+pub async fn start(
+	cancel: CancellationToken,
+	config: Config,
+	services: Service,
+) -> anyhow::Result<()> {
+	if !config.prewarm.enabled {
+		return Ok(());
+	}
+
+	let cache_directory = config.directory.relative();
+	let mut receiver = services.version.subscribe();
+
+	loop {
+		select! {
+			result = receiver.recv() => {
+				match result {
+					Ok(bm_version::VersionMessage::Changed(key)) => {
+						if services.version.resolve(bm_version::Manager::DEFAULT_NAME) != Some(key) {
+							continue;
+						}
+
+						if let Err(error) = wait_for_version_ready(cancel.child_token(), &services.data, key).await {
+							tracing::warn!(%key, ?error, "failed waiting for asset prewarm version readiness");
+							continue;
+						}
+
+						if let Err(error) = prewarm_latest_archives(&services, &cache_directory, &config.prewarm, key).await {
+							tracing::warn!(%key, ?error, "failed prewarming latest asset archives");
+						}
+					}
+					Ok(bm_version::VersionMessage::Hydrate(_)) => {}
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+						tracing::warn!(skipped, "asset prewarm receiver lagged");
+					}
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+				}
+			}
+			_ = cancel.cancelled() => break,
+		}
+	}
+
+	Ok(())
 }
 
 // Original asset endpoint based on a game path in the url path.
@@ -438,23 +499,7 @@ async fn icons_archive(
 		&cache_directory,
 		version_key,
 		&cache_key,
-		|| {
-			let mut writer = zip_writer();
-			let mut found = 0usize;
-
-			for group_index in 0..ICON_GROUP_COUNT {
-				let group = group_index * ICONS_PER_GROUP;
-				found += write_icon_group(&mut writer, &asset, version_key, group, format.0)?;
-			}
-
-			if found == 0 {
-				return Err(super::error::Error::NotFound(
-					"no icons found in standard icon groups".into(),
-				));
-			}
-
-			finish_zip(writer)
-		},
+		|| build_icons_archive_bytes(&asset, version_key, format.0),
 	)?;
 
 	zip_bytes_response(bytes, filename)
@@ -534,50 +579,7 @@ async fn maps_archive(
 		&cache_directory,
 		version_key,
 		&cache_key,
-		|| {
-			let mut writer = zip_writer();
-			let mut found = 0usize;
-
-			for &a in MAP_LETTERS {
-				for b in b'0'..=b'9' {
-					for &c in MAP_LETTERS {
-						for d in b'0'..=b'9' {
-							let territory = format!(
-								"{}{}{}{}",
-								a as char, b as char, c as char, d as char
-							);
-
-							for index in 0..MAP_INDEX_COUNT {
-								let index = format!("{index:02}");
-								let bytes = match asset.map(version_key, &territory, &index, format) {
-									Ok(bytes) => bytes,
-									Err(bm_asset::Error::NotFound(..)) => continue,
-									Err(error) => return Err(error.into()),
-								};
-
-								write_zip_file(
-									&mut writer,
-									&format!(
-										"ui/map/{territory}/{index}/{territory}_{index}.{}",
-										format.extension()
-									),
-									&bytes,
-								)?;
-								found += 1;
-							}
-						}
-					}
-				}
-			}
-
-			if found == 0 {
-				return Err(super::error::Error::NotFound(
-					"no maps found in standard territory/index combinations".into(),
-				));
-			}
-
-			finish_zip(writer)
-		},
+		|| build_maps_archive_bytes(&asset, version_key, format),
 	)?;
 
 	zip_bytes_response(bytes, filename)
@@ -712,46 +714,7 @@ async fn uld_archive(
 	let bytes = if let Some(bytes) = read_cached_archive(&cache_path)? {
 		bytes
 	} else {
-		let paths = fetch_perchbird_paths("ui/uld/").await?;
-		let mut writer = zip_writer();
-		let mut found = 0usize;
-
-		for path in paths {
-			if path.to_ascii_lowercase().ends_with(".uld") {
-				let bytes = match asset.raw(version_key, &path) {
-					Ok(bytes) => bytes,
-					Err(bm_asset::Error::NotFound(..)) => continue,
-					Err(error) => return Err(error.into()),
-				};
-
-				write_zip_file(&mut writer, &path, &bytes)?;
-				found += 1;
-				continue;
-			}
-
-			if is_texture_path(&path) {
-				let bytes = match asset.convert(version_key, &path, format.0) {
-					Ok(bytes) => bytes,
-					Err(bm_asset::Error::NotFound(..)) => continue,
-					Err(error) => return Err(error.into()),
-				};
-
-				write_zip_file(
-					&mut writer,
-					&replace_extension(&path, extension),
-					&bytes,
-				)?;
-				found += 1;
-			}
-		}
-
-		if found == 0 {
-			return Err(super::error::Error::NotFound(
-				"no uld files or textures found from path list".into(),
-			));
-		}
-
-		let bytes = finish_zip(writer)?;
+		let bytes = build_uld_archive_bytes(&asset, version_key, format.0).await?;
 		write_cached_archive(&cache_path, &bytes)?;
 		bytes
 	};
@@ -818,6 +781,124 @@ fn write_icon_group(
 	}
 
 	Ok(found)
+}
+
+fn build_icons_archive_bytes(
+	asset: &bm_asset::Service,
+	version_key: bm_version::VersionKey,
+	format: Format,
+) -> Result<Vec<u8>> {
+	let mut writer = zip_writer();
+	let mut found = 0usize;
+
+	for group_index in 0..ICON_GROUP_COUNT {
+		let group = group_index * ICONS_PER_GROUP;
+		found += write_icon_group(&mut writer, asset, version_key, group, format)?;
+	}
+
+	if found == 0 {
+		return Err(super::error::Error::NotFound(
+			"no icons found in standard icon groups".into(),
+		));
+	}
+
+	finish_zip(writer)
+}
+
+fn build_maps_archive_bytes(
+	asset: &bm_asset::Service,
+	version_key: bm_version::VersionKey,
+	format: Format,
+) -> Result<Vec<u8>> {
+	let mut writer = zip_writer();
+	let mut found = 0usize;
+
+	for &a in MAP_LETTERS {
+		for b in b'0'..=b'9' {
+			for &c in MAP_LETTERS {
+				for d in b'0'..=b'9' {
+					let territory = format!(
+						"{}{}{}{}",
+						a as char, b as char, c as char, d as char
+					);
+
+					for index in 0..MAP_INDEX_COUNT {
+						let index = format!("{index:02}");
+						let bytes = match asset.map(version_key, &territory, &index, format) {
+							Ok(bytes) => bytes,
+							Err(bm_asset::Error::NotFound(..)) => continue,
+							Err(error) => return Err(error.into()),
+						};
+
+						write_zip_file(
+							&mut writer,
+							&format!(
+								"ui/map/{territory}/{index}/{territory}_{index}.{}",
+								format.extension()
+							),
+							&bytes,
+						)?;
+						found += 1;
+					}
+				}
+			}
+		}
+	}
+
+	if found == 0 {
+		return Err(super::error::Error::NotFound(
+			"no maps found in standard territory/index combinations".into(),
+		));
+	}
+
+	finish_zip(writer)
+}
+
+async fn build_uld_archive_bytes(
+	asset: &bm_asset::Service,
+	version_key: bm_version::VersionKey,
+	format: Format,
+) -> Result<Vec<u8>> {
+	let paths = fetch_perchbird_paths("ui/uld/").await?;
+	let mut writer = zip_writer();
+	let mut found = 0usize;
+
+	for path in paths {
+		if path.to_ascii_lowercase().ends_with(".uld") {
+			let bytes = match asset.raw(version_key, &path) {
+				Ok(bytes) => bytes,
+				Err(bm_asset::Error::NotFound(..)) => continue,
+				Err(error) => return Err(error.into()),
+			};
+
+			write_zip_file(&mut writer, &path, &bytes)?;
+			found += 1;
+			continue;
+		}
+
+		if is_texture_path(&path) {
+			let bytes = match asset.convert(version_key, &path, format) {
+				Ok(bytes) => bytes,
+				Err(bm_asset::Error::NotFound(..)) => continue,
+				Err(error) => return Err(error.into()),
+			};
+
+			write_zip_file(
+				&mut writer,
+				&replace_extension(&path, format.extension()),
+				&bytes,
+			)?;
+			found += 1;
+		}
+	}
+
+	if found == 0 {
+		return Err(super::error::Error::NotFound(
+			"no uld files or textures found from path list".into(),
+		));
+	}
+
+	finish_zip(writer)
 }
 
 fn write_zip_file(
@@ -927,6 +1008,14 @@ fn default_cache_directory() -> RelativePathBuf {
 	"asset".into()
 }
 
+fn default_prewarm_formats() -> Vec<Format> {
+	vec![Format::Webp]
+}
+
+fn default_true() -> bool {
+	true
+}
+
 fn default_map_format() -> SchemaFormat {
 	SchemaFormat(Format::Jpeg)
 }
@@ -994,6 +1083,63 @@ fn hash_string(value: &str) -> u64 {
 	let mut hasher = SeaHasher::new();
 	value.hash(&mut hasher);
 	hasher.finish()
+}
+
+async fn wait_for_version_ready(
+	cancel: CancellationToken,
+	data: &bm_data::Data,
+	version_key: bm_version::VersionKey,
+) -> anyhow::Result<()> {
+	loop {
+		if data.version(version_key).is_ok() {
+			return Ok(());
+		}
+
+		select! {
+			_ = cancel.cancelled() => anyhow::bail!("cancelled while waiting for version readiness"),
+			_ = time::sleep(Duration::from_secs(1)) => {}
+		}
+	}
+}
+
+async fn prewarm_latest_archives(
+	services: &Service,
+	cache_directory: &StdPath,
+	config: &PrewarmConfig,
+	version_key: bm_version::VersionKey,
+) -> anyhow::Result<()> {
+	for format in &config.formats {
+		if config.icons {
+			let cache_key = format!("icons/all-{}.zip", format.extension());
+			let _ = cached_archive(cache_directory, version_key, &cache_key, || {
+				build_icons_archive_bytes(&services.asset, version_key, *format)
+			})?;
+			tracing::info!(%version_key, format = %format.extension(), "prewarmed latest icon archive");
+		}
+
+		if config.maps {
+			let cache_key = format!("maps/all-{}.zip", format.extension());
+			let _ = cached_archive(cache_directory, version_key, &cache_key, || {
+				build_maps_archive_bytes(&services.asset, version_key, *format)
+			})?;
+			tracing::info!(%version_key, format = %format.extension(), "prewarmed latest map archive");
+		}
+
+		if config.uld_archive {
+			let cache_path = archive_cache_path(
+				cache_directory,
+				version_key,
+				&format!("uld/archive-{}.zip", format.extension()),
+			);
+			if read_cached_archive(&cache_path)?.is_none() {
+				let bytes = build_uld_archive_bytes(&services.asset, version_key, *format).await?;
+				write_cached_archive(&cache_path, &bytes)?;
+			}
+			tracing::info!(%version_key, format = %format.extension(), "prewarmed latest uld archive");
+		}
+	}
+
+	Ok(())
 }
 
 async fn cache_layer(

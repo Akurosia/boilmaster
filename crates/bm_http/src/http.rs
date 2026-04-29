@@ -56,6 +56,10 @@ pub async fn serve(
 		},
 	};
 
+	let background_state = state.clone();
+	let api1_config = config.api1.clone();
+	let background_cancel = cancel.clone();
+
 	let router = Router::new()
 		.nest("/admin", admin::router(config.admin, state.clone()))
 		.nest("/api/1", api1::router(config.api1, state.clone()))
@@ -82,6 +86,12 @@ pub async fn serve(
 				.on_response(DefaultOnResponse::new().level(Level::TRACE))
 				.on_failure(DefaultOnFailure::new().level(Level::TRACE)),
 		);
+
+	tokio::spawn(async move {
+		if let Err(error) = api1::start(background_cancel.child_token(), api1_config, background_state).await {
+			tracing::error!(?error, "api1 background services failed");
+		}
+	});
 
 	let listener = TcpListener::bind(bind_address).await.unwrap();
 	axum::serve(listener, router)
