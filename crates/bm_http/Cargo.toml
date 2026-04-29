@@ -28,12 +28,14 @@ aide = { workspace = true, features = [
 axum = { workspace = true, features = ["macros"] }
 axum-extra = { workspace = true, features = ["typed-header"] }
 either.workspace = true
+flate2.workspace = true
 git-version.workspace = true
 ironworks = { workspace = true }
 ironworks_schema.workspace = true
 maud = { workspace = true, features = ["axum"] }
 mime.workspace = true
 nom.workspace = true
+reqwest.workspace = true
 regex.workspace = true
 schemars = { workspace = true, features = ["preserve_order", "uuid1"] }
 seahash.workspace = true
@@ -45,6 +47,7 @@ tokio-util.workspace = true
 tower-http = { workspace = true, features = ["cors", "trace"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde"] }
+zip.workspace = true
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"

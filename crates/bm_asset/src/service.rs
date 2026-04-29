@@ -37,7 +37,30 @@ impl Service {
 		converter.convert(&data_version, path, format)
 	}
 
-	pub fn map(&self, version: VersionKey, territory: &str, index: &str) -> Result<Vec<u8>> {
+	pub fn raw(&self, version: VersionKey, path: &str) -> Result<Vec<u8>> {
+		let version = self
+			.data
+			.version(version)
+			.with_context(|| format!("data for {version} not ready"))?;
+
+		version
+			.ironworks()
+			.file::<Vec<u8>>(path)
+			.map_err(|error| match error {
+				ironworks::Error::NotFound(ironworks::ErrorValue::Path(_)) => {
+					Error::NotFound(path.into())
+				}
+				other => Error::Failure(other.into()),
+			})
+	}
+
+	pub fn map(
+		&self,
+		version: VersionKey,
+		territory: &str,
+		index: &str,
+		format: Format,
+	) -> Result<Vec<u8>> {
 		let version = self
 			.data
 			.version(version)
@@ -47,7 +70,7 @@ impl Service {
 
 		let image = self.compose_map(&ironworks, territory, index)?;
 
-		texture::write(image, image::ImageFormat::Jpeg)
+		texture::write(image, map_image_format(format))
 	}
 
 	fn compose_map(
@@ -89,6 +112,14 @@ impl Service {
 		}
 
 		Ok(buffer_map)
+	}
+}
+
+fn map_image_format(format: Format) -> image::ImageFormat {
+	match format {
+		Format::Jpeg => image::ImageFormat::Jpeg,
+		Format::Png => image::ImageFormat::Png,
+		Format::Webp => image::ImageFormat::WebP,
 	}
 }
 
