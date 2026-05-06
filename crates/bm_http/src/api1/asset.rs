@@ -118,6 +118,14 @@ pub async fn start(
 	let cache_directory = config.directory.relative();
 	let mut receiver = services.version.subscribe();
 
+	if let Some(key) = services.version.resolve(bm_version::Manager::DEFAULT_NAME) {
+		if let Err(error) = wait_for_version_ready(cancel.child_token(), &services.data, key).await {
+			tracing::warn!(%key, ?error, "failed waiting for startup asset prewarm version readiness");
+		} else if let Err(error) = prewarm_latest_archives(&services, &cache_directory, &config.prewarm, key).await {
+			tracing::warn!(%key, ?error, "failed prewarming latest asset archives at startup");
+		}
+	}
+
 	loop {
 		select! {
 			result = receiver.recv() => {
@@ -174,6 +182,17 @@ struct MapQuery {
 	/// Format that composed maps should be converted into.
 	#[schemars(example = "example_map_format")]
 	format: Option<SchemaFormat>,
+
+	/// Optional filename style for the downloaded file.
+	#[serde(default)]
+	filename: Option<MapFilenameStyle>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum MapFilenameStyle {
+	Default,
+	PlaceNames,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -564,7 +583,7 @@ fn parse_icon_group(value: &str) -> Result<u32> {
 #[debug_handler(state = AssetState)]
 async fn maps_archive(
 	VersionQuery(version_key): VersionQuery,
-	Query(MapQuery { format }): Query<MapQuery>,
+	Query(MapQuery { format, .. }): Query<MapQuery>,
 	State(AssetState {
 		services: Service { asset, .. },
 		cache_directory,
@@ -726,20 +745,26 @@ async fn uld_archive(
 async fn map(
 	Path(MapPath { territory, index }): Path<MapPath>,
 	VersionQuery(version_key): VersionQuery,
-	Query(MapQuery { format }): Query<MapQuery>,
-	State(Service { asset, .. }): State<Service>,
+	Query(MapQuery { format, filename }): Query<MapQuery>,
+	State(Service { asset, data, .. }): State<Service>,
 ) -> Result<impl IntoApiResponse> {
 	let format = format.unwrap_or_else(default_map_format).0;
 	let bytes = asset.map(version_key, &territory, &index, format)?;
+	let filename = map_download_filename(
+		&data,
+		version_key,
+		&territory,
+		&index,
+		format,
+		filename.unwrap_or(MapFilenameStyle::Default),
+	)
+	.unwrap_or_else(|| format!("{territory}_{index}.{}", format.extension()));
 
 	let response = (
 		TypedHeader(ContentType::from(format_mime(format))),
 		[(
 			header::CONTENT_DISPOSITION,
-			format!(
-				"inline; filename=\"{territory}_{index}.{}\"",
-				format.extension()
-			),
+			format!("inline; filename=\"{filename}\""),
 		)],
 		bytes,
 	);
@@ -1014,6 +1039,85 @@ fn default_prewarm_formats() -> Vec<Format> {
 
 fn default_true() -> bool {
 	true
+}
+
+fn map_download_filename(
+	data: &bm_data::Data,
+	version_key: bm_version::VersionKey,
+	territory: &str,
+	index: &str,
+	format: Format,
+	style: MapFilenameStyle,
+) -> Option<String> {
+	match style {
+		MapFilenameStyle::Default => None,
+		MapFilenameStyle::PlaceNames => {
+			let excel = data.version(version_key).ok()?.excel();
+			let names = lookup_map_place_names(&excel, territory, index)?;
+			let stem = sanitize_filename(&names.join(" - "));
+			Some(format!("{stem}.{}", format.extension()))
+		}
+	}
+}
+
+fn lookup_map_place_names(
+	excel: &ironworks::excel::Excel,
+	territory: &str,
+	index: &str,
+) -> Option<Vec<String>> {
+	let map_sheet = excel.sheet("Map").ok()?;
+	let map_id = format!("{territory}/{index}");
+
+	for row in map_sheet.into_iter() {
+		let row = row.ok()?;
+		let id = row.field(1).ok()?.into_string().ok()?.to_string();
+		if id != map_id {
+			continue;
+		}
+
+		let mut names = Vec::new();
+		for column in [5usize, 6, 7] {
+			let place_id = row.field(column).ok()?.into_u32().ok()?;
+			if place_id == 0 {
+				continue;
+			}
+
+			let name = lookup_place_name(excel, place_id)?;
+			if !name.is_empty() && !names.iter().any(|existing| existing == &name) {
+				names.push(name);
+			}
+		}
+
+		return (!names.is_empty()).then_some(names);
+	}
+
+	None
+}
+
+fn lookup_place_name(excel: &ironworks::excel::Excel, row_id: u32) -> Option<String> {
+	let sheet = excel.sheet("PlaceName").ok()?;
+	let row = sheet.row(row_id).ok()?;
+	let value = row.field(1).ok()?.into_string().ok()?.to_string();
+	Some(value.trim().to_string())
+}
+
+fn sanitize_filename(value: &str) -> String {
+	let mut sanitized = String::with_capacity(value.len());
+
+	for character in value.chars() {
+		match character {
+			'<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => sanitized.push('_'),
+			character if character.is_control() => {}
+			_ => sanitized.push(character),
+		}
+	}
+
+	let sanitized = sanitized.trim().trim_matches('.').trim();
+	if sanitized.is_empty() {
+		"map".to_string()
+	} else {
+		sanitized.to_string()
+	}
 }
 
 fn default_map_format() -> SchemaFormat {
