@@ -38,10 +38,10 @@ COPY . .
 
 ARG arch
 
-ARG pkg_config_path
-ARG pkg_config_sysroot_dir
-ENV PKG_CONFIG_PATH=${pkg_config_path}
-ENV PKG_CONFIG_SYSROOT_DIR=${pkg_config_sysroot_dir}
+ARG pkg-config-path
+ARG pkg-config-sysroot-dir
+ENV PKG_CONFIG_PATH=${pkg-config-path}
+ENV PKG_CONFIG_SYSROOT_DIR=${pkg-config-sysroot-dir}
 
 RUN cargo build --release --target ${arch} --bin boilmaster
 
